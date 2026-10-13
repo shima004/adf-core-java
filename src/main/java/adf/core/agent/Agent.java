@@ -17,6 +17,11 @@ import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
 import rescuecore2.components.AbstractAgent;
+import rescuecore2.components.ComponentConnectionException;
+import rescuecore2.components.RequestIDGenerator;
+import rescuecore2.config.Config;
+import rescuecore2.connection.Connection;
+import rescuecore2.connection.ConnectionException;
 import rescuecore2.messages.Command;
 import rescuecore2.messages.Message;
 import rescuecore2.messages.control.KASense;
@@ -47,6 +52,7 @@ public abstract class Agent<E extends StandardEntity>
   protected boolean isPrecompute;
   protected boolean isDebugMode;
   private int ignoreTime;
+  private AgentConnectionLifecycle connectionLifecycle;
 
   protected Agent(String teamName, boolean isPrecompute, String dataStorageName, boolean isDebugMode, ModuleConfig moduleConfig, DevelopData developData) {
     this.teamName = teamName;
@@ -64,6 +70,32 @@ public abstract class Agent<E extends StandardEntity>
     this.messageManager = new MessageManager();
   }
 
+
+  @Override
+  public void connect(Connection connection, RequestIDGenerator generator,
+      Config config) throws ConnectionException, ComponentConnectionException,
+      InterruptedException {
+    connectionLifecycle = new AgentConnectionLifecycle(connection, super::shutdown);
+    try {
+      super.connect(connection, generator, config);
+    } catch (ConnectionException | ComponentConnectionException
+        | InterruptedException | RuntimeException e) {
+      connection.shutdown();
+      throw e;
+    }
+    connectionLifecycle.start();
+  }
+
+  @Override
+  public void shutdown() {
+    try {
+      super.shutdown();
+    } finally {
+      if (connectionLifecycle != null) {
+        connectionLifecycle.requestShutdown();
+      }
+    }
+  }
 
   @Override
   public final int[] getRequestedEntityURNs() {
