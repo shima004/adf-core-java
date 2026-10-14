@@ -16,15 +16,24 @@ import adf.core.launcher.ConsoleOutput;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import rescuecore2.components.AbstractAgent;
 import rescuecore2.components.ComponentConnectionException;
 import rescuecore2.components.RequestIDGenerator;
 import rescuecore2.config.Config;
 import rescuecore2.connection.Connection;
 import rescuecore2.connection.ConnectionException;
+import rescuecore2.connection.ConnectionListener;
 import rescuecore2.messages.Command;
 import rescuecore2.messages.Message;
 import rescuecore2.messages.control.KASense;
+import rescuecore2.messages.control.AKConnect;
+import rescuecore2.messages.control.AKAcknowledge;
+import rescuecore2.messages.control.KAConnectOK;
+import rescuecore2.messages.control.KAConnectError;
 import rescuecore2.standard.entities.StandardEntity;
 import rescuecore2.standard.entities.StandardEntityURN;
 import rescuecore2.standard.entities.StandardWorldModel;
@@ -53,6 +62,10 @@ public abstract class Agent<E extends StandardEntity>
   protected boolean isDebugMode;
   private int ignoreTime;
   private AgentConnectionLifecycle connectionLifecycle;
+  // Interval for checking connection loss while waiting for initialization.
+  private static final long CONNECT_REPLY_POLL_INTERVAL_MILLIS = 100;
+  private final Object initializationLock = new Object();
+  private boolean processorStarted;
 
   protected Agent(String teamName, boolean isPrecompute, String dataStorageName, boolean isDebugMode, ModuleConfig moduleConfig, DevelopData developData) {
     this.teamName = teamName;
@@ -75,25 +88,83 @@ public abstract class Agent<E extends StandardEntity>
   public void connect(Connection connection, RequestIDGenerator generator,
       Config config) throws ConnectionException, ComponentConnectionException,
       InterruptedException {
-    connectionLifecycle = new AgentConnectionLifecycle(connection, super::shutdown);
-    try {
-      super.connect(connection, generator, config);
-    } catch (ConnectionException | ComponentConnectionException
-        | InterruptedException | RuntimeException e) {
-      connection.shutdown();
-      throw e;
-    }
+    this.config = config;
+    CountDownLatch reply = new CountDownLatch(1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    AtomicBoolean replyAccepted = new AtomicBoolean();
+    int requestID = generator.generateRequestID();
+    connectionLifecycle = new AgentConnectionLifecycle(connection, this::stopProcessor);
+    ConnectionListener listener = (c, message) -> {
+      if (message instanceof KAConnectOK ok && ok.getRequestID() == requestID
+          && replyAccepted.compareAndSet(false, true)) {
+        // The library's processor inherits daemon status from its creator.
+        // Uncooperative user code must not keep the JVM alive after disconnect.
+        Thread initializer = new Thread(() -> {
+          try {
+            synchronized (initializationLock) {
+              if (connectionLifecycle.isShutdownRequested()) {
+                throw new ConnectionException("Connection closed during initialization");
+              }
+              postConnect(c, ok.getAgentID(), ok.getEntities(), ok.getConfig());
+              processorStarted = true;
+              c.sendMessage(new AKAcknowledge(requestID, ok.getAgentID()));
+            }
+          } catch (Throwable e) {
+            failure.set(e);
+          } finally {
+            reply.countDown();
+          }
+        }, "ADF agent initialization");
+        initializer.setDaemon(true);
+        initializer.start();
+      } else if (message instanceof KAConnectError error
+          && error.getRequestID() == requestID
+          && replyAccepted.compareAndSet(false, true)) {
+        failure.set(new ComponentConnectionException(error.getReason()));
+        reply.countDown();
+      }
+    };
+    connection.addConnectionListener(listener);
     connectionLifecycle.start();
+    boolean connected = false;
+    try {
+      connection.sendMessage(new AKConnect(requestID, 2, getName(), getRequestedEntityURNs()));
+      while (!reply.await(CONNECT_REPLY_POLL_INTERVAL_MILLIS, TimeUnit.MILLISECONDS)) {
+        if (!connection.isAlive() || connectionLifecycle.isShutdownRequested()) {
+          throw new ConnectionException("Connection closed before agent initialization completed");
+        }
+      }
+      Throwable error = failure.get();
+      if (error instanceof ComponentConnectionException e) {
+        throw e;
+      }
+      if (error != null) {
+        throw new ComponentConnectionException(error);
+      }
+      if (!connection.isAlive() || connectionLifecycle.isShutdownRequested()) {
+        throw new ConnectionException("Connection closed during agent initialization");
+      }
+      connected = true;
+    } finally {
+      connection.removeConnectionListener(listener);
+      if (!connected) {
+        connectionLifecycle.requestShutdown();
+      }
+    }
+  }
+
+  private void stopProcessor() {
+    synchronized (initializationLock) {
+      if (processorStarted) {
+        super.shutdown();
+      }
+    }
   }
 
   @Override
   public void shutdown() {
-    try {
-      super.shutdown();
-    } finally {
-      if (connectionLifecycle != null) {
-        connectionLifecycle.requestShutdown();
-      }
+    if (connectionLifecycle != null) {
+      connectionLifecycle.requestShutdown();
     }
   }
 

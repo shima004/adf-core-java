@@ -1,9 +1,16 @@
 package adf.core.agent;
 
 import rescuecore2.connection.Connection;
+import rescuecore2.log.Logger;
 
 /** Closes transport workers after a shutdown message or a lost connection. */
 final class AgentConnectionLifecycle {
+  private static final long CONNECTION_STATUS_POLL_INTERVAL_MILLIS = 100;
+
+  // Maximum wait for agent processing to stop during shutdown or disconnect
+  // cleanup. This does not limit think() during a running simulation.
+  private static final long AGENT_SHUTDOWN_WAIT_TIMEOUT_MILLIS = 2_000;
+
   private final Connection connection;
   private final Runnable stopAgent;
   private volatile boolean shutdownRequested;
@@ -22,20 +29,41 @@ final class AgentConnectionLifecycle {
     shutdownRequested = true;
   }
 
+  boolean isShutdownRequested() {
+    return shutdownRequested;
+  }
+
   private void awaitShutdown() {
+    boolean interrupted = false;
     try {
       while (!shutdownRequested && connection.isAlive()) {
-        Thread.sleep(100);
+        Thread.sleep(CONNECTION_STATUS_POLL_INTERVAL_MILLIS);
       }
     } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
+      // Complete cleanup before restoring the interrupt status.
+      interrupted = true;
     } finally {
-      // Do this outside the connection's broadcast callback: shutdown joins
-      // transport workers and must not race a callback waiting for that join.
+      shutdownRequested = true;
+      Thread cleanup = new Thread(stopAgent, "ADF agent shutdown");
+      cleanup.setDaemon(true);
+      cleanup.start();
+      // Shutdown joins transport workers; never call it in a broadcast callback.
       try {
-        stopAgent.run();
-      } finally {
         connection.shutdown();
+      } finally {
+        try {
+          cleanup.join(AGENT_SHUTDOWN_WAIT_TIMEOUT_MILLIS);
+          if (cleanup.isAlive()) {
+            Logger.warn("Agent processing did not stop within "
+                + AGENT_SHUTDOWN_WAIT_TIMEOUT_MILLIS + " ms during shutdown");
+          }
+        } catch (InterruptedException e) {
+          interrupted = true;
+        } finally {
+          if (interrupted) {
+            Thread.currentThread().interrupt();
+          }
+        }
       }
     }
   }
